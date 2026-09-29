@@ -1103,6 +1103,7 @@ async function generateStagedDynamicFlightRenderResultNode(
 
       return dynamicStream
     },
+    // Fold `PrefetchStatic_prefetch` into PrefetchStatic - no discrimination needed here
     () => stageController.advanceStage(RenderStage.PrefetchStatic),
     () => stageController.advanceStage(RenderStage.NavigationStatic),
     () => stageController.advanceStage(RenderStage.Static),
@@ -1243,6 +1244,7 @@ async function stagedRenderWithoutCachesInDevNode(
         }
       )
     },
+    () => stageController.advanceStage(RenderStage.PrefetchStatic_prefetch),
     () => stageController.advanceStage(RenderStage.PrefetchStatic),
     () => stageController.advanceStage(RenderStage.NavigationStatic),
     () => stageController.advanceStage(RenderStage.Static),
@@ -1254,11 +1256,13 @@ function getEnvironmentNameForStageWithoutCaches(stage: RenderStage) {
   switch (stage) {
     case RenderStage.Before:
     case RenderStage.ShellStatic:
+    case RenderStage.PrefetchStatic_prefetch:
     case RenderStage.PrefetchStatic:
     case RenderStage.NavigationStatic:
     case RenderStage.Static:
       return 'Prerender'
     case RenderStage.ShellRuntime:
+    case RenderStage.PrefetchRuntime_prefetch:
     case RenderStage.PrefetchRuntime:
     case RenderStage.NavigationRuntime:
     case RenderStage.Dynamic:
@@ -1918,6 +1922,7 @@ async function finalRuntimeServerPrerender(
     },
     () => {
       if (checkUnexpectedAbort()) return
+      // Fold `PrefetchStatic_prefetch` into PrefetchStatic - no discrimination needed here
       stageController.advanceStage(RenderStage.PrefetchStatic)
     },
     () => {
@@ -1932,12 +1937,14 @@ async function finalRuntimeServerPrerender(
       if (checkUnexpectedAbort()) return
       stageController.advanceStage(RenderStage.ShellRuntime)
     },
+
     () => {
       if (checkUnexpectedAbort()) return
 
       // We may not reach this stage depending on the mode.
       if (finalStage < RenderStage.PrefetchRuntime) return
 
+      // Fold `PrefetchRuntime_prefetch` into PrefetchRuntime - no discrimination needed here
       stageController.advanceStage(RenderStage.PrefetchRuntime)
     },
     () => {
@@ -4001,6 +4008,7 @@ async function renderToStream(
 
             return dynamicStream
           },
+          // Fold `PrefetchStatic_prefetch` into PrefetchStatic - no discrimination needed here
           () => stageController.advanceStage(RenderStage.PrefetchStatic),
           () => stageController.advanceStage(RenderStage.NavigationStatic),
           () => stageController.advanceStage(RenderStage.Static),
@@ -5474,11 +5482,13 @@ function getEnvironmentNameForStage(stage: RenderStage) {
   switch (stage) {
     case RenderStage.Before:
     case RenderStage.ShellStatic:
+    case RenderStage.PrefetchStatic_prefetch:
     case RenderStage.PrefetchStatic:
     case RenderStage.NavigationStatic:
     case RenderStage.Static:
       return 'Prerender'
     case RenderStage.ShellRuntime:
+    case RenderStage.PrefetchRuntime_prefetch:
     case RenderStage.PrefetchRuntime:
     case RenderStage.NavigationRuntime:
       return 'Prefetch'
@@ -5745,6 +5755,7 @@ async function streamStagedRenderInDev({
     },
     () => checkReveal(RenderStage.ShellStatic),
 
+    () => checkCacheMissAndAdvance(RenderStage.PrefetchStatic_prefetch),
     () => checkCacheMissAndAdvance(RenderStage.PrefetchStatic),
     () => checkCacheMissAndAdvance(RenderStage.NavigationStatic),
     () => checkCacheMissAndAdvance(RenderStage.Static),
@@ -5753,6 +5764,7 @@ async function streamStagedRenderInDev({
     () => checkCacheMissAndAdvance(RenderStage.ShellRuntime),
     () => checkReveal(RenderStage.ShellRuntime),
 
+    () => checkCacheMissAndAdvance(RenderStage.PrefetchRuntime_prefetch),
     () => checkCacheMissAndAdvance(RenderStage.PrefetchRuntime),
     () => checkReveal(RenderStage.PrefetchRuntime),
 
@@ -5906,10 +5918,12 @@ async function renderWithWarmCachesForValidationInDev(
         validationAbortSignal
       )
     },
+    () => stageController.advanceStage(RenderStage.PrefetchStatic_prefetch),
     () => stageController.advanceStage(RenderStage.PrefetchStatic),
     () => stageController.advanceStage(RenderStage.NavigationStatic),
     () => stageController.advanceStage(RenderStage.Static),
     () => stageController.advanceStage(RenderStage.ShellRuntime),
+    () => stageController.advanceStage(RenderStage.PrefetchRuntime_prefetch),
     () => stageController.advanceStage(RenderStage.PrefetchRuntime),
     () => stageController.advanceStage(RenderStage.NavigationRuntime),
     () => stageController.advanceStage(RenderStage.Dynamic)
@@ -6040,10 +6054,12 @@ async function prerenderWithWarmCachesForStaticValidationInDev(
         collectChunk
       )
     },
+    () => stageController.advanceStage(RenderStage.PrefetchStatic_prefetch),
     () => stageController.advanceStage(RenderStage.PrefetchStatic),
     () => stageController.advanceStage(RenderStage.NavigationStatic),
     () => stageController.advanceStage(RenderStage.Static),
     () => stageController.advanceStage(RenderStage.ShellRuntime),
+    () => stageController.advanceStage(RenderStage.PrefetchRuntime_prefetch),
     () => stageController.advanceStage(RenderStage.PrefetchRuntime),
     // NOTE: We don't need `NavigationRuntime`, because we set `needsRuntimeShell: false`
     // so `navigation()` resolves in the static stages.
@@ -7599,7 +7615,10 @@ async function validateInstantConfigs(
 
   const { implicitTags, nonce, workStore, isDebugChannelEnabled } = ctx
 
-  type RetryStage = RenderStage.PrefetchRuntime | RenderStage.NavigationRuntime
+  type RetryStage =
+    | RenderStage.PrefetchRuntime_prefetch
+    | RenderStage.PrefetchRuntime
+    | RenderStage.NavigationRuntime
 
   type ValidationSequence = {
     stageOrder: [...PrefetchedSegmentStage[], RenderStage.Dynamic]
@@ -7633,6 +7652,7 @@ async function validateInstantConfigs(
     [ValidationPrefetchKind.StaticAppShell]: defineValidationSequence({
       stageOrder: [
         RenderStage.ShellStatic,
+        RenderStage.PrefetchStatic_prefetch,
         RenderStage.PrefetchStatic,
         RenderStage.NavigationStatic,
         RenderStage.PrefetchRuntime,
@@ -7640,7 +7660,8 @@ async function validateInstantConfigs(
       ],
       holeResolution: {
         [RenderStage.ShellStatic]: null, // initial stage
-        [RenderStage.PrefetchStatic]: DynamicHoleKind.Link, // TODO(ensure-static): distinguish static link data
+        [RenderStage.PrefetchStatic_prefetch]: DynamicHoleKind.Prefetch,
+        [RenderStage.PrefetchStatic]: DynamicHoleKind.Link,
         [RenderStage.NavigationStatic]: DynamicHoleKind.Navigation,
         [RenderStage.PrefetchRuntime]: DynamicHoleKind.Runtime, // TODO(ensure-static): distinguish session data
         [RenderStage.Dynamic]: DynamicHoleKind.Dynamic,
@@ -7649,12 +7670,14 @@ async function validateInstantConfigs(
     [ValidationPrefetchKind.RuntimeAppShell]: defineValidationSequence({
       stageOrder: [
         RenderStage.ShellRuntime,
+        RenderStage.PrefetchRuntime_prefetch,
         RenderStage.PrefetchRuntime,
         RenderStage.NavigationRuntime,
         RenderStage.Dynamic,
       ],
       holeResolution: {
         [RenderStage.ShellRuntime]: null, // initial stage
+        [RenderStage.PrefetchRuntime_prefetch]: DynamicHoleKind.Prefetch,
         [RenderStage.PrefetchRuntime]: DynamicHoleKind.Link,
         [RenderStage.NavigationRuntime]: DynamicHoleKind.Navigation,
         [RenderStage.Dynamic]: DynamicHoleKind.Dynamic,
@@ -8204,10 +8227,12 @@ async function renderWithRestartOnCacheMissInValidation(
       accumulatedChunksPromise.catch(() => {})
       return { accumulatedChunksPromise }
     },
+    () => advanceStageIfNoCacheMiss(RenderStage.PrefetchStatic_prefetch),
     () => advanceStageIfNoCacheMiss(RenderStage.PrefetchStatic),
     () => advanceStageIfNoCacheMiss(RenderStage.NavigationStatic),
     () => advanceStageIfNoCacheMiss(RenderStage.Static),
     () => advanceStageIfNoCacheMiss(RenderStage.ShellRuntime),
+    () => advanceStageIfNoCacheMiss(RenderStage.PrefetchRuntime_prefetch),
     () => advanceStageIfNoCacheMiss(RenderStage.PrefetchRuntime),
     () => advanceStageIfNoCacheMiss(RenderStage.NavigationRuntime),
     () => advanceStageIfNoCacheMiss(RenderStage.Dynamic)
@@ -8307,10 +8332,14 @@ async function renderWithRestartOnCacheMissInValidation(
         accumulatedChunksPromise,
       }
     },
+    () =>
+      finalStageController.advanceStage(RenderStage.PrefetchStatic_prefetch),
     () => finalStageController.advanceStage(RenderStage.PrefetchStatic),
     () => finalStageController.advanceStage(RenderStage.NavigationStatic),
     () => finalStageController.advanceStage(RenderStage.Static),
     () => finalStageController.advanceStage(RenderStage.ShellRuntime),
+    () =>
+      finalStageController.advanceStage(RenderStage.PrefetchRuntime_prefetch),
     () => finalStageController.advanceStage(RenderStage.PrefetchRuntime),
     () => finalStageController.advanceStage(RenderStage.NavigationRuntime),
     () => finalStageController.advanceStage(RenderStage.Dynamic)
@@ -9690,6 +9719,10 @@ async function prerenderToStream(
             streamState,
             collectedChunks.allChunks !== null
           )
+        },
+        () => {
+          if (checkUnexpectedAbort()) return
+          finalStageController.advanceStage(RenderStage.PrefetchStatic_prefetch)
         },
         () => {
           if (checkUnexpectedAbort()) return
