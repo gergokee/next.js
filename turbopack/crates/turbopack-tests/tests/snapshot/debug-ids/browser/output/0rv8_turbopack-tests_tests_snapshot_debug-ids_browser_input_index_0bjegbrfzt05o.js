@@ -1,4 +1,4 @@
-;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="6165c1d1-d5b9-7d3a-3889-39dd6d668107")}catch(e){}}();
+;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="3330c3e4-f7f5-ba8b-3b9a-dfd2e152633f")}catch(e){}}();
 (globalThis["TURBOPACK"] || (globalThis["TURBOPACK"] = [])).push([
     "output/0rv8_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_0bjegbrfzt05o.js",
     {"otherChunks":["output/0_9x_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_03ibyvsq4xsbk.js"],"runtimeModuleIds":["[project]/turbopack/crates/turbopack-tests/tests/snapshot/debug-ids/browser/input/index.js [test] (ecmascript)"]}
@@ -72,21 +72,26 @@ const REEXPORTED_OBJECTS = new WeakMap();
     this.e = exports;
 }
 const contextPrototype = Context.prototype;
+contextPrototype.R = {
+    shareScopes: Object.create(null),
+    initScopes: Object.create(null),
+    remoteInitializations: Object.create(null)
+};
 const hasOwnProperty = Object.prototype.hasOwnProperty;
 const toStringTag = typeof Symbol !== 'undefined' && Symbol.toStringTag;
 function defineProp(obj, name, options) {
     if (!hasOwnProperty.call(obj, name)) Object.defineProperty(obj, name, options);
 }
 function getOverwrittenModule(moduleCache, id) {
-    let module = moduleCache.get(id);
-    if (module === undefined) {
+    let module = moduleCache[id];
+    if (!module) {
         if (createModuleWithDirectionFlag) {
             // set in development modes for hmr support
             module = createModuleWithDirection(id);
         } else {
             module = createModuleObject(id);
         }
-        moduleCache.set(id, module);
+        moduleCache[id] = module;
     }
     return module;
 }
@@ -110,7 +115,7 @@ function createModuleWithDirection(id) {
         children: []
     };
 }
-const BindingTag_Accessor = 0;
+const BindingTag_Value = 0;
 /**
  * Terminates a module's group of entries in an {@link EsmReexports} list.
  */ const REEXPORT_GROUP_END = 0;
@@ -126,9 +131,19 @@ const BindingTag_Accessor = 0;
     let i = 0;
     while(i < bindings.length){
         const propName = bindings[i++];
-        if (bindings[i] === BindingTag_Accessor && typeof bindings[i + 1] === 'function') {
-            i++;
-            const getterFn = bindings[i++];
+        const tagOrFunction = bindings[i++];
+        if (typeof tagOrFunction === 'number') {
+            if (tagOrFunction === BindingTag_Value) {
+                defineProp(exports, propName, {
+                    value: bindings[i++],
+                    enumerable: true,
+                    writable: false
+                });
+            } else {
+                throw new Error(`unexpected tag: ${tagOrFunction}`);
+            }
+        } else {
+            const getterFn = tagOrFunction;
             if (typeof bindings[i] === 'function') {
                 const setterFn = bindings[i++];
                 defineProp(exports, propName, {
@@ -142,12 +157,6 @@ const BindingTag_Accessor = 0;
                     enumerable: true
                 });
             }
-        } else {
-            defineProp(exports, propName, {
-                value: bindings[i++],
-                enumerable: true,
-                writable: false
-            });
         }
     }
     // The properties defined above are already non-configurable and
@@ -266,9 +275,8 @@ function appendReexportBinding(bindings, exportedName, namespace, importedName) 
     if (descriptor) {
         if ('value' in descriptor) {
             // Code generation only routes immutable imported bindings through this helper, so a data
-            // descriptor is a constant export and can be captured once. Values are untagged; only
-            // accessors carry a tag.
-            bindings.push(exportedName, descriptor.value);
+            // descriptor is a constant export and can be captured once.
+            bindings.push(exportedName, BindingTag_Value, descriptor.value);
             return;
         }
         if (descriptor.get) {
@@ -279,12 +287,12 @@ function appendReexportBinding(bindings, exportedName, namespace, importedName) 
             // and the CommonJS/dynamic-namespace paths create arrows in `createGetter` and
             // `getOwnPropertyDescriptor`. The destination can therefore reuse the exact function instead
             // of allocating another wrapper getter.
-            bindings.push(exportedName, BindingTag_Accessor, descriptor.get);
+            bindings.push(exportedName, descriptor.get);
             return;
         }
     }
     // Dynamic/proxy/inherited CommonJS edge cases may not expose a usable own descriptor.
-    bindings.push(exportedName, BindingTag_Accessor, ()=>namespace[importedName]);
+    bindings.push(exportedName, ()=>namespace[importedName]);
 }
 function ensureDynamicExports(module, exports) {
     let reexportedObjects = REEXPORTED_OBJECTS.get(module);
@@ -439,10 +447,9 @@ function createGetter(obj, key) {
     let defaultLocation = -1;
     for(let current = raw; (typeof current === 'object' || typeof current === 'function') && !LEAF_PROTOTYPES.includes(current); current = getProto(current)){
         for (const key of Object.getOwnPropertyNames(current)){
-            bindings.push(key, BindingTag_Accessor, createGetter(raw, key));
+            bindings.push(key, createGetter(raw, key));
             if (defaultLocation === -1 && key === 'default') {
-                // The index of the tag, so that the tag and the getter can be replaced together below.
-                defaultLocation = bindings.length - 2;
+                defaultLocation = bindings.length - 1;
             }
         }
     }
@@ -450,12 +457,11 @@ function createGetter(obj, key) {
     // we should set the `default` getter if the imported module is a `.cjs file`
     if (!(allowExportDefault && defaultLocation >= 0)) {
         // Replace the binding with one for the namespace itself in order to preserve iteration order.
-        // Values are untagged, so `raw` is bound directly even when it is itself a function.
         if (defaultLocation >= 0) {
-            // Replace the tag and getter with the value
-            bindings.splice(defaultLocation, 2, raw);
+            // Replace the getter with the value
+            bindings.splice(defaultLocation, 1, BindingTag_Value, raw);
         } else {
-            bindings.push('default', raw);
+            bindings.push('default', BindingTag_Value, raw);
         }
     }
     esm(ns, bindings);
@@ -648,14 +654,6 @@ contextPrototype.U = relativeURL;
             invariant(sourceType, (sourceType)=>`Unknown source type: ${sourceType}`);
     }
     return `Module ${moduleId} was instantiated ${instantiationReason}, but the module factory is not available.`;
-}
-/**
- * Returns a `file://` URL under a synthetic directory named after `root`
- * (`ROOT` for the project root), for when the real filesystem path is unknown.
- * The root name and path segments are percent-encoded so the result is always
- * a valid file URI.
- */ function placeholderFileUrl(modulePath, root) {
-    return `file:///${encodeURIComponent(root ?? 'ROOT')}/${modulePath.split('/').map(encodeURIComponent).join('/')}`;
 }
 /**
  * A stub function to make `require` available but non-functional in ESM.
@@ -938,7 +936,13 @@ async function loadChunkInternal(sourceType, sourceData, chunkData) {
 const loadedChunk = Promise.resolve(undefined);
 const instrumentedBackendLoadChunks = new WeakMap();
 // Do not make this async. React relies on referential equality of the returned Promise.
-function loadChunkByUrl(chunkEntry) {
+function loadChunkByUrl(chunkEntry, resolveOnLoad = false) {
+    if (resolveOnLoad) {
+        if (typeof chunkEntry !== 'string') {
+            return Promise.reject(new Error('External scripts cannot use merged chunk metadata'));
+        }
+        return BACKEND.loadChunkCached(SourceType.Parent, chunkEntry, true);
+    }
     return loadChunkByUrlInternal(SourceType.Parent, this.m.id, chunkEntry);
 }
 browserContextPrototype.L = loadChunkByUrl;
@@ -1051,7 +1055,7 @@ function loadChunkPath(sourceType, sourceData, chunkPath) {
     const exported = this.r(moduleId);
     return exported?.default ?? exported;
 }
-browserContextPrototype.R = resolvePathFromModule;
+browserContextPrototype.S = resolvePathFromModule;
 /**
  * no-op for browser
  * @param modulePath
@@ -1060,10 +1064,14 @@ browserContextPrototype.R = resolvePathFromModule;
 }
 browserContextPrototype.P = resolveAbsolutePath;
 /**
- * Returns a placeholder `file://` URL for the given module path, which is
- * relative to the project root or the named `root`. The browser runtime
- * intentionally does not expose the real filesystem path.
- */ browserContextPrototype.F = placeholderFileUrl;
+ * Returns a placeholder `file://` URL for the given module path. The browser
+ * runtime intentionally does not expose the real filesystem path. Path
+ * segments are percent-encoded so the result is always a valid file URI.
+ */ function resolveFileUrl(modulePath) {
+    if (!modulePath) return 'file:///ROOT/';
+    return `file:///ROOT/${modulePath.split('/').map(encodeURIComponent).join('/')}`;
+}
+browserContextPrototype.F = resolveFileUrl;
 /**
  * Exports a URL with the static suffix appended.
  */ function exportUrl(url, id) {
@@ -1251,7 +1259,7 @@ function formatDependencyChain(dependencyChain) {
                 dependencyChain
             };
         }
-        const module = devModuleCache.get(moduleId);
+        const module = devModuleCache[moduleId];
         const hotState = moduleHotState.get(module);
         if (// The module is not in the cache. Since this is a "modified" update,
         // it means that the module was never instantiated before.
@@ -1279,7 +1287,7 @@ function formatDependencyChain(dependencyChain) {
             continue;
         }
         for (const parentId of module.parents){
-            const parent = devModuleCache.get(parentId);
+            const parent = devModuleCache[parentId];
             if (!parent) {
                 continue;
             }
@@ -1478,7 +1486,7 @@ function formatDependencyChain(dependencyChain) {
  */ function computeOutdatedSelfAcceptedModules(outdatedModules) {
     const outdatedSelfAcceptedModules = [];
     for (const moduleId of outdatedModules){
-        const module = devModuleCache.get(moduleId);
+        const module = devModuleCache[moduleId];
         const hotState = moduleHotState.get(module);
         if (module && hotState?.selfAccepted && !hotState.selfInvalidated) {
             outdatedSelfAcceptedModules.push({
@@ -1496,7 +1504,7 @@ function formatDependencyChain(dependencyChain) {
  * NOTE: mode = "replace" will not remove modules from devModuleCache.
  * This must be done in a separate step afterwards.
  */ function disposeModule(moduleId, mode) {
-    const module = devModuleCache.get(moduleId);
+    const module = devModuleCache[moduleId];
     if (!module) {
         return;
     }
@@ -1520,7 +1528,7 @@ function formatDependencyChain(dependencyChain) {
     // It will be added back once the module re-instantiates and imports its
     // children again.
     for (const childId of module.children){
-        const child = devModuleCache.get(childId);
+        const child = devModuleCache[childId];
         if (!child) {
             continue;
         }
@@ -1531,7 +1539,7 @@ function formatDependencyChain(dependencyChain) {
     }
     switch(mode){
         case 'clear':
-            devModuleCache.delete(module.id);
+            delete devModuleCache[module.id];
             moduleHotData.delete(module.id);
             break;
         case 'replace':
@@ -1555,16 +1563,16 @@ function formatDependencyChain(dependencyChain) {
     // We also want to keep track of previous parents of the outdated modules.
     const outdatedModuleParents = new Map();
     for (const moduleId of outdatedModules){
-        const oldModule = devModuleCache.get(moduleId);
+        const oldModule = devModuleCache[moduleId];
         outdatedModuleParents.set(moduleId, oldModule?.parents);
-        devModuleCache.delete(moduleId);
+        delete devModuleCache[moduleId];
     }
     // Remove outdated dependencies from parent module's children list.
     // When a parent accepts a child's update, the child is re-instantiated
     // but the parent stays alive. We remove the old child reference so it
     // gets re-added when the child re-imports.
     for (const [parentId, deps] of outdatedDependencies){
-        const module = devModuleCache.get(parentId);
+        const module = devModuleCache[parentId];
         if (module) {
             for (const dep of deps){
                 const idx = module.children.indexOf(dep);
@@ -1616,7 +1624,7 @@ function formatDependencyChain(dependencyChain) {
     module.parents = parents;
     module.children = [];
     module.hot = hot;
-    devModuleCache.set(id, module);
+    devModuleCache[id] = module;
     moduleHotState.set(module, hotState);
     // 5. Module execution (React Refresh hooks are platform-specific)
     try {
@@ -1750,7 +1758,7 @@ function formatDependencyChain(dependencyChain) {
     // This runs BEFORE re-instantiating self-accepted modules, matching
     // webpack's behavior.
     for (const [parentId, deps] of outdatedDependencies){
-        const module = devModuleCache.get(parentId);
+        const module = devModuleCache[parentId];
         if (!module) continue;
         const hotState = moduleHotState.get(module);
         if (!hotState) continue;
@@ -1800,7 +1808,7 @@ function formatDependencyChain(dependencyChain) {
                 try {
                     errorHandler(err, {
                         moduleId,
-                        module: devModuleCache.get(moduleId)
+                        module: devModuleCache[moduleId]
                     });
                 } catch (err2) {
                     reportError(err2);
@@ -1860,7 +1868,7 @@ const devContextPrototype = Context.prototype;
  * It will be appended to the runtime code of each runtime right after the
  * shared runtime utils.
  */ /* eslint-disable @typescript-eslint/no-unused-vars */ // Assign browser's module cache and runtime modules to shared HMR state
-devModuleCache = new Map();
+devModuleCache = Object.create(null);
 devContextPrototype.c = devModuleCache;
 runtimeModules = new Set();
 // Set flag to indicate we use ModuleWithDirection
@@ -1890,7 +1898,7 @@ createModuleWithDirectionFlag = true;
  * Gets or instantiates a runtime module.
  */ // @ts-ignore
 function getOrInstantiateRuntimeModule(chunkPath, moduleId) {
-    const module = devModuleCache.get(moduleId);
+    const module = devModuleCache[moduleId];
     if (module) {
         if (module.error) {
             throw module.error;
@@ -1907,7 +1915,7 @@ const getOrInstantiateModuleFromParent = (id, sourceModule)=>{
     if (!sourceModule.hot.active) {
         console.warn(`Unexpected import of module ${id} from module ${sourceModule.id}, which was deleted by an HMR update`);
     }
-    const module = devModuleCache.get(id);
+    const module = devModuleCache[id];
     if (sourceModule.children.indexOf(id) === -1) {
         sourceModule.children.push(id);
     }
@@ -2282,7 +2290,7 @@ function registerChunk(registration) {
 function getAssetSuffixFromScriptSrc() {
     // TURBOPACK_ASSET_SUFFIX is set in web workers
     if (self.TURBOPACK_ASSET_SUFFIX != null) return self.TURBOPACK_ASSET_SUFFIX;
-    const src = document?.currentScript?.getAttribute?.('src') ?? '';
+    const src = typeof document === 'undefined' ? '' : document.currentScript?.getAttribute?.('src') ?? '';
     const qi = src.indexOf('?');
     return qi >= 0 ? src.slice(qi) : '';
 }
@@ -2298,7 +2306,7 @@ let BACKEND;
             if (chunk != null) {
                 chunkPath = getPathFromScript(chunk);
                 const resolver = getOrCreateResolver(getUrlFromScript(chunk));
-                resolver.resolve();
+                markChunkRegistered(resolver);
             }
             if (params == null) {
                 return;
@@ -2320,33 +2328,46 @@ let BACKEND;
         /**
      * Loads the given chunk, and returns a promise that resolves once the chunk
      * has been loaded.
-     */ loadChunkCached (sourceType, chunkUrl) {
-            return doLoadChunk(sourceType, chunkUrl);
+     */ loadChunkCached (sourceType, chunkUrl, resolveOnLoad = false) {
+            return doLoadChunk(sourceType, chunkUrl, resolveOnLoad);
         }
     };
     function getOrCreateResolver(chunkUrl) {
         let resolver = chunkResolvers.get(chunkUrl);
         if (!resolver) {
-            let resolve;
-            let reject;
-            const promise = new Promise((innerResolve, innerReject)=>{
-                resolve = innerResolve;
-                reject = innerReject;
-            });
             resolver = {
-                resolved: false,
+                loaded: false,
+                registered: false,
                 loadingStarted: false,
                 retryAttempts: 0,
-                promise,
-                resolve: ()=>{
-                    resolver.resolved = true;
-                    resolve();
-                },
-                reject: reject
+                load: {},
+                registration: {}
             };
             chunkResolvers.set(chunkUrl, resolver);
         }
         return resolver;
+    }
+    function getOrCreatePromise(state, completed) {
+        if (completed) return Promise.resolve();
+        if (!state.promise) {
+            state.promise = new Promise((resolve, reject)=>{
+                state.resolve = resolve;
+                state.reject = reject;
+            });
+        }
+        return state.promise;
+    }
+    function getResolverPromise(resolver, resolveOnLoad) {
+        return resolveOnLoad ? getOrCreatePromise(resolver.load, resolver.loaded) : getOrCreatePromise(resolver.registration, resolver.registered);
+    }
+    function markChunkLoaded(resolver) {
+        resolver.loaded = true;
+        resolver.load.resolve?.();
+    }
+    function markChunkRegistered(resolver) {
+        resolver.registered = true;
+        markChunkLoaded(resolver);
+        resolver.registration.resolve?.();
     }
     /**
    * Rejects a chunk resolver and drops it from the cache.
@@ -2356,7 +2377,8 @@ let BACKEND;
         if (chunkResolvers.get(chunkUrl) === resolver) {
             chunkResolvers.delete(chunkUrl);
         }
-        resolver.reject(error);
+        resolver.load.reject?.(error);
+        resolver.registration.reject?.(error);
     }
     function getChunkLoadRetryDelayMs() {
         const jitter = Math.floor(Math.random() * (CHUNK_LOAD_RETRY_MAX_JITTER_MS + 1));
@@ -2377,24 +2399,34 @@ let BACKEND;
             // if this chunk is being fetched multiple times, and one of those
             // attempts succeeds. or, if this chunk has another resolver
             // mapped to it - it's safe to skip retrying.
-            if (resolver.resolved || chunkResolvers.get(chunkUrl) !== resolver) {
+            if (resolver.loaded || chunkResolvers.get(chunkUrl) !== resolver) {
                 return;
             }
             if (reload) {
                 reload();
             } else {
                 resolver.loadingStarted = false;
-                doLoadChunk(sourceType, chunkUrl);
+                doLoadChunk(sourceType, chunkUrl, resolver.registration.promise == null);
             }
         }, getChunkLoadRetryDelayMs());
+    }
+    function getExistingScripts(chunkUrl) {
+        const requested = new URL(chunkUrl, document.baseURI).href;
+        return Array.from(document.scripts).filter((script)=>{
+            const src = script.getAttribute('src');
+            if (src == null) return false;
+            const existing = new URL(src, document.baseURI).href;
+            return existing === requested || existing.startsWith(`${requested}?`);
+        });
     }
     /**
    * Loads the given chunk, and returns a promise that resolves once the chunk
    * has been loaded.
-   */ function doLoadChunk(sourceType, chunkUrl) {
+   */ function doLoadChunk(sourceType, chunkUrl, resolveOnLoad = false) {
         const resolver = getOrCreateResolver(chunkUrl);
+        const promise = getResolverPromise(resolver, resolveOnLoad);
         if (resolver.loadingStarted) {
-            return resolver.promise;
+            return promise;
         }
         if (sourceType === SourceType.Runtime) {
             // We don't need to load chunks references from runtime code, as they're already
@@ -2403,28 +2435,30 @@ let BACKEND;
             if (isCss(chunkUrl)) {
                 // CSS chunks do not register themselves, and as such must be marked as
                 // loaded instantly.
-                resolver.resolve();
+                markChunkRegistered(resolver);
             }
             // We need to wait for JS chunks to register themselves within `registerChunk`
             // before we can start instantiating runtime modules, hence the absence of
-            // `resolver.resolve()` in this branch.
-            return resolver.promise;
+            // `markChunkRegistered()` in this branch.
+            return promise;
         }
+        resolver.loadingStarted = true;
         if (typeof importScripts === 'function') {
-            // We're in a web worker
+            // We're in a classic web worker.
             if (isCss(chunkUrl)) {
             // ignore
             } else if (isJs(chunkUrl)) {
                 self.TURBOPACK_NEXT_CHUNK_URLS.push(chunkUrl);
                 try {
                     importScripts(chunkUrl);
+                    markChunkLoaded(resolver);
                 } catch (error) {
                     onChunkLoadError(sourceType, chunkUrl, resolver, error);
                 }
             } else {
                 throw new Error(`can't infer type of chunk from URL ${chunkUrl} in worker`);
             }
-        } else {
+        } else if (typeof document !== 'undefined') {
             // TODO(PACK-2140): remove this once all filenames are guaranteed to be escaped.
             const decodedChunkUrl = decodeURI(chunkUrl);
             if (isCss(chunkUrl)) {
@@ -2432,7 +2466,7 @@ let BACKEND;
                 if (previousLinks.length > 0) {
                     // CSS chunks do not register themselves, and as such must be marked as
                     // loaded instantly.
-                    resolver.resolve();
+                    markChunkRegistered(resolver);
                 } else {
                     const createLink = ()=>{
                         const link = document.createElement('link');
@@ -2449,7 +2483,7 @@ let BACKEND;
                         link.onload = ()=>{
                             // CSS chunks do not register themselves, and as such must be marked as
                             // loaded instantly.
-                            resolver.resolve();
+                            markChunkRegistered(resolver);
                         };
                         return link;
                     };
@@ -2457,9 +2491,12 @@ let BACKEND;
                     document.head.appendChild(createLink());
                 }
             } else if (isJs(chunkUrl)) {
-                const previousScripts = document.querySelectorAll(`script[src="${chunkUrl}"],script[src^="${chunkUrl}?"],script[src="${decodedChunkUrl}"],script[src^="${decodedChunkUrl}?"]`);
+                const previousScripts = getExistingScripts(chunkUrl);
                 if (previousScripts.length > 0) {
                     for (const script of Array.from(previousScripts)){
+                        script.addEventListener('load', ()=>markChunkLoaded(resolver), {
+                            once: true
+                        });
                         script.addEventListener('error', ()=>{
                             // Drop the failed tag so a retry can re-add it cleanly.
                             script.remove();
@@ -2472,9 +2509,7 @@ let BACKEND;
                     const script = document.createElement('script');
                     script.crossOrigin = CROSS_ORIGIN;
                     script.src = chunkUrl;
-                    // We'll only mark the chunk as loaded once the script has been executed,
-                    // which happens in `registerChunk`. Hence the absence of `resolve()` in
-                    // this branch.
+                    script.onload = ()=>markChunkLoaded(resolver);
                     script.onerror = ()=>{
                         // Drop the failed tag so a retry can re-add it cleanly.
                         script.remove();
@@ -2486,9 +2521,10 @@ let BACKEND;
             } else {
                 throw new Error(`can't infer type of chunk from URL ${chunkUrl}`);
             }
+        } else {
+            throw new Error('chunk loading is not supported in module workers');
         }
-        resolver.loadingStarted = true;
-        return resolver.promise;
+        return promise;
     }
 })();
 /**
@@ -2613,5 +2649,5 @@ chunkListsToRegister.forEach(registerChunkList);
 })();
 
 
-//# debugId=6165c1d1-d5b9-7d3a-3889-39dd6d668107
+//# debugId=3330c3e4-f7f5-ba8b-3b9a-dfd2e152633f
 //# sourceMappingURL=0_9x_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_0bjegbrfzt05o.js.map
