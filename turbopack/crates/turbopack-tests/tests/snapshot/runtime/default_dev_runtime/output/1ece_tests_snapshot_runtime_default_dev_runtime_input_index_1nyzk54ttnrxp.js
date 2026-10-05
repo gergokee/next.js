@@ -1061,7 +1061,7 @@ function loadChunkPath(sourceType, sourceData, chunkPath) {
     const exported = this.r(moduleId);
     return exported?.default ?? exported;
 }
-browserContextPrototype.S = resolvePathFromModule;
+browserContextPrototype.p = resolvePathFromModule;
 /**
  * no-op for browser
  * @param modulePath
