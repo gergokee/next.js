@@ -1414,9 +1414,10 @@ impl TurboTasksBackend {
             let _ = (inner, item);
         };
 
-        // The scan captures the modified tasks, so it must run while operations are still
-        // excluded. Encoding happens later, in the returned iterators.
+        // The scan captures the modified tasks, so it needs the exclusion (`snapshot_phase`).
+        // Encoding happens later, in the returned iterators.
         let task_snapshots = self.storage.take_snapshot(
+            &snapshot_phase,
             snapshot_guard,
             &process,
             &inspect_snapshot_item,

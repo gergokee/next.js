@@ -2284,6 +2284,7 @@ mod cell_data_tracking_tests {
     use crate::{
         backend::{
             TaskDataCategory,
+            snapshot_coordinator::SnapshotCoordinator,
             storage::{SnapshotMask, Storage, StorageOptions, encode_task_contents},
             storage_schema::TaskStorageAccessors,
         },
@@ -2478,7 +2479,10 @@ mod cell_data_tracking_tests {
              _: SnapshotMask,
              _: &mut TurboBincodeBuffer|
              -> SnapshotItem { panic!("the pre-encoded snapshot item must be used") };
-        let shards = storage.take_snapshot(snapshot_guard, &process, &|_, _| {}, false);
+        let coordinator = SnapshotCoordinator::new();
+        let phase = coordinator.try_begin_snapshot().unwrap();
+        let shards = storage.take_snapshot(&phase, snapshot_guard, &process, &|_, _| {}, false);
+        drop(phase);
 
         {
             let mut g = guard_for(&storage, task_id);
