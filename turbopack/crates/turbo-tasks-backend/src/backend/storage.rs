@@ -231,9 +231,8 @@ pub(crate) fn encode_task_contents(
 /// Converts a task's current state into the [`SnapshotItem`] that persistence writes for it.
 ///
 /// Only the categories in `mask` are encoded. A `new_task` (per the task's flag) additionally
-/// carries its task type hash
-/// so it can be added to the task cache. When `gc_enabled` is set, a GC-deleted task becomes a
-/// [`SnapshotItem::Delete`] tombstone.
+/// carries its task type hash so it can be added to the task cache. When `gc_enabled` is set, a
+/// GC-deleted task becomes a [`SnapshotItem::Delete`] tombstone.
 ///
 /// This is shared by the regular snapshot path and by [`StorageWriteGuard::track_modification`],
 /// which encodes a task eagerly when it is about to be mutated while a snapshot that captured it
@@ -340,7 +339,8 @@ pub struct Storage {
     /// `TaskStorage`) is required for consistency: a clone would share cell contents with
     /// interior mutability via `Arc`, so later mutations could leak into the supposedly frozen
     /// copy. Persistence uses the item as-is, so no work is wasted. Entries are removed when the
-    /// iterator persists the task, so the map is empty outside of snapshots.
+    /// iterator persists the task (or when a captured task is not persisted, see
+    /// `SnapshotShard`'s `Drop`), so the map is empty outside of snapshots.
     ///
     /// Lock Ordering: `snapshots` locks are acquired **after** `map` locks (see the comment on
     /// `map` below). Holding a `snapshots` shard write lock and then trying to take a `map` shard
@@ -489,8 +489,8 @@ impl Storage {
     /// for `process`.
     ///
     /// The returned shards implement `IntoIterator`. Empty shards (no modified entries) are
-    /// filtered out. Every shard must be fully consumed: dropping one before it has yielded all
-    /// its captured tasks panics, since their modifications would otherwise be lost.
+    /// filtered out. Captured tasks that are not yielded (e.g. because a shard or its iterator is
+    /// dropped early when persisting fails) are marked as modified again.
     ///
     /// When `drain_entries` is true (shutdown only), the scan drains the map: unmodified entries
     /// are erased and freed immediately, and the modified entries are moved out into the
@@ -591,6 +591,7 @@ impl Storage {
             };
 
             Some(SnapshotShard {
+                shard_idx,
                 work,
                 storage: self,
                 process,
@@ -622,14 +623,12 @@ impl Storage {
 
     /// End snapshot mode.
     ///
-    /// Captured tasks are persisted by the shard iterators, which also remove their `snapshots`
-    /// entries, so there is nothing left to reconcile here.
+    /// Captured tasks are persisted (or restored as modified) by the shard iterators, which also
+    /// remove their `snapshots` entries, so there is nothing left to reconcile here.
     fn end_snapshot(&self) {
         self.snapshot_mode.store(false, Ordering::Release);
-        // Skipped while unwinding: an aborted snapshot may leave entries behind, and panicking
-        // again would abort.
         debug_assert!(
-            std::thread::panicking() || self.snapshots.is_empty(),
+            self.snapshots.is_empty(),
             "all copy-on-write snapshots must be consumed by the snapshot iterators"
         );
         // If we are saving a non-trivial amount of memory just clear it out.
@@ -1193,6 +1192,7 @@ enum ShardWork {
 }
 
 pub struct SnapshotShard<'l, P, I> {
+    shard_idx: usize,
     work: ShardWork,
     storage: &'l Storage,
     process: &'l P,
@@ -1219,19 +1219,33 @@ where
 }
 
 impl<P, I> Drop for SnapshotShard<'_, P, I> {
-    /// A shard must be fully consumed: its captured tasks have had their `modified` flags moved to
-    /// `*_snapshot_pending`, so dropping it early would silently lose those modifications.
+    /// Captured tasks that were not persisted (the shard or its iterator was dropped before
+    /// yielding them, e.g. because persisting failed) are marked as modified again so the next
+    /// snapshot persists them.
     fn drop(&mut self) {
-        let ShardWork::Keep(remaining) = &self.work else {
+        let ShardWork::Keep(remaining) = &mut self.work else {
             // Drain mode: the map is discarded after this snapshot anyway.
             return;
         };
-        // Don't panic again while already unwinding (e.g. `process` panicked): that would abort.
-        if !remaining.is_empty() && !std::thread::panicking() {
-            panic!(
-                "snapshot shard dropped before all captured tasks were persisted ({} remaining)",
-                remaining.len()
-            );
+        for task_id in remaining.drain(..) {
+            // Lock order: map first, then snapshots.
+            let Some(mut task) = self.storage.map.get_mut(&task_id) else {
+                continue;
+            };
+            self.storage.snapshots.remove(&task_id);
+            let already_modified = task.flags.any_modified();
+            let flags = &mut task.flags;
+            if flags.meta_snapshot_pending() {
+                flags.set_meta_modified(true);
+            }
+            if flags.data_snapshot_pending() {
+                flags.set_data_modified(true);
+            }
+            flags.set_meta_snapshot_pending(false);
+            flags.set_data_snapshot_pending(false);
+            if !already_modified && task.flags.any_modified() {
+                self.storage.shard_modified_counts[self.shard_idx].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1256,7 +1270,9 @@ where
         let buffer = &mut self.buffer;
         match &mut self.shard.work {
             ShardWork::Keep(captured) => {
-                let task_id = captured.pop()?;
+                // Leave the task in `captured` until encoding succeeds: if `process` panics,
+                // dropping the shard still restores the captured flags for this task.
+                let task_id = *captured.last()?;
                 let storage = self.shard.storage;
                 let mut inner = storage.map.get_mut(&task_id).unwrap();
                 // If the task was modified since the capture, `track_modification` already encoded
@@ -1271,6 +1287,8 @@ where
                 inner.flags.set_meta_snapshot_pending(false);
                 inner.flags.set_data_snapshot_pending(false);
                 inner.flags.set_new_task(false);
+                drop(inner);
+                captured.pop();
                 Some(item)
             }
             ShardWork::Drain(entries) => {
@@ -1726,13 +1744,14 @@ mod tests {
         assert_eq!(items.len(), 1);
     }
 
-    /// If encoding a captured task panics, the unwind drops shards that still hold captured
-    /// tasks; that must not panic a second time (which would abort the process).
+    /// If encoding a captured task panics, that task remains in the shard work list so the
+    /// shard's drop restores it as modified for the next snapshot.
     #[tokio::test(flavor = "multi_thread")]
     #[cfg_attr(target_family = "wasm", ignore = "no unwinding on wasm")]
-    async fn panicking_process_does_not_double_panic() {
+    async fn panicking_process_restores_current_captured_task() {
         let storage = Storage::new(StorageOptions::for_tests());
-        for task_id in (1..=8).map(non_transient_task) {
+        let task_id = non_transient_task(1);
+        {
             let mut guard = storage.access_mut(task_id);
             let _ = guard.track_modification(SpecificTaskDataCategory::Data, "test");
         }
@@ -1744,7 +1763,6 @@ mod tests {
                        _: &mut TurboBincodeBuffer|
          -> SnapshotItem { panic!("encoding failed") };
         let shards = storage.take_snapshot(snapshot_guard, &process, &noop_inspect, false);
-        assert_eq!(shards.len(), 2, "both shards hold captured tasks");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             shards.into_iter().flatten().collect::<Vec<_>>()
         }));
@@ -1752,6 +1770,14 @@ mod tests {
             panic!("the encoding panic must propagate");
         };
         assert_eq!(err.downcast_ref::<&str>(), Some(&"encoding failed"));
+
+        let guard = storage.access_mut(task_id);
+        assert!(guard.flags.data_modified());
+        assert!(!guard.flags.any_snapshot_pending());
+        assert_eq!(
+            storage.shard_modified_counts[storage.shard_index(&task_id)].load(Ordering::Relaxed),
+            1
+        );
     }
 
     /// A captured task tracked again before being persisted stores a pre-mutation encoded item in
@@ -1855,14 +1881,54 @@ mod tests {
         assert!(!guard.flags.any_modified());
     }
 
-    /// Snapshot shards must be fully consumed: dropping one that still holds captured tasks
-    /// would silently lose those modifications, so it panics. The other shards and the snapshot
-    /// guard (with a copy-on-write entry still in `snapshots`) are then dropped while unwinding
-    /// and must not panic again.
+    /// Captured tasks that are never yielded (the shards or their iterators are dropped early,
+    /// e.g. because persisting failed) must be marked as modified again so no change is lost.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(target_family = "wasm", ignore = "no unwinding on wasm")]
-    #[should_panic(expected = "snapshot shard dropped before all captured tasks were persisted")]
-    async fn dropping_shard_early_panics() {
+    async fn dropping_shards_early_restores_pending_as_modified() {
+        let storage = Storage::new(StorageOptions::for_tests());
+        let task_ids: Vec<_> = (1..=8).map(non_transient_task).collect();
+        for &task_id in &task_ids {
+            let mut guard = storage.access_mut(task_id);
+            let _ = guard.track_modification(SpecificTaskDataCategory::Data, "test");
+        }
+        // One task is also frozen into `snapshots` by a modification after the capture.
+        let frozen = task_ids[0];
+
+        let (snapshot_guard, _) = storage.start_snapshot();
+        let shards = storage.take_snapshot(snapshot_guard, &dummy_process, &noop_inspect, false);
+        {
+            let mut guard = storage.access_mut(frozen);
+            let _ = guard.track_modification(SpecificTaskDataCategory::Meta, "test");
+        }
+        assert!(storage.snapshots.contains_key(&frozen));
+
+        // Consume one item from the first shard, then drop everything.
+        let mut shards = shards.into_iter();
+        let mut first = shards.next().unwrap().into_iter();
+        assert!(first.next().is_some());
+        drop(first);
+        drop(shards);
+
+        assert!(storage.snapshots.is_empty());
+        let mut restored = 0;
+        for &task_id in &task_ids {
+            let guard = storage.access_mut(task_id);
+            assert!(!guard.flags.any_snapshot_pending());
+            if guard.flags.data_modified() {
+                restored += 1;
+            }
+        }
+        // All but the one persisted task have their captured data modification restored.
+        assert_eq!(restored, task_ids.len() - 1);
+        let (_guard, has_modifications) = storage.start_snapshot();
+        assert!(has_modifications);
+    }
+
+    /// A persistence error that returns before consuming the shards (here: the in-memory noop
+    /// backing storage rejects writes) must be returned as an error, not turned into a panic, and
+    /// the captured tasks must be marked as modified again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_save_snapshot_restores_captured_tasks() {
         let storage = Storage::new(StorageOptions::for_tests());
         let task_ids: Vec<_> = (1..=8).map(non_transient_task).collect();
         for &task_id in &task_ids {
@@ -1872,13 +1938,47 @@ mod tests {
 
         let (snapshot_guard, _) = storage.start_snapshot();
         let shards = storage.take_snapshot(snapshot_guard, &dummy_process, &noop_inspect, false);
-        assert_eq!(shards.len(), 2, "both shards hold captured tasks");
+        // A modification after the capture leaves a copy-on-write entry behind.
         {
             let mut guard = storage.access_mut(task_ids[0]);
             let _ = guard.track_modification(SpecificTaskDataCategory::Meta, "test");
         }
         assert!(storage.snapshots.contains_key(&task_ids[0]));
-        drop(shards);
+
+        let result = crate::noop_backing_storage().save_snapshot(None, shards);
+        assert!(result.is_err(), "the noop backing storage rejects writes");
+
+        assert!(storage.snapshots.is_empty());
+        for &task_id in &task_ids {
+            let guard = storage.access_mut(task_id);
+            assert!(guard.flags.data_modified());
+            assert!(!guard.flags.any_snapshot_pending());
+        }
+        // The live meta modification made during the snapshot is kept as well.
+        assert!(storage.access_mut(task_ids[0]).flags.meta_modified());
+        // Every task is counted exactly once, including the one that was already dirty again.
+        for (shard_idx, count) in storage.shard_modified_counts.iter().enumerate() {
+            let expected = task_ids
+                .iter()
+                .filter(|id| storage.shard_index(id) == shard_idx)
+                .count() as u64;
+            assert_eq!(count.load(Ordering::Relaxed), expected);
+        }
+
+        // The next snapshot captures and persists all of them.
+        let (snapshot_guard, has_modifications) = storage.start_snapshot();
+        assert!(has_modifications);
+        let shards = storage.take_snapshot(snapshot_guard, &dummy_process, &noop_inspect, false);
+        let mut persisted: Vec<_> = shards
+            .into_iter()
+            .flatten()
+            .map(|item| match item {
+                SnapshotItem::Put { task_id, .. } => task_id,
+                SnapshotItem::Delete { .. } => panic!("expected a Put item"),
+            })
+            .collect();
+        persisted.sort();
+        assert_eq!(persisted, task_ids);
     }
 
     /// `inspect_snapshot_item` sees every yielded item, including a task that was modified again
