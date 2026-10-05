@@ -4,6 +4,7 @@ mod eviction;
 mod gc;
 mod operation;
 mod snapshot_coordinator;
+mod stateful_cell;
 mod storage;
 pub mod storage_schema;
 
@@ -22,7 +23,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use auto_hash_map::{AutoMap, AutoSet};
 use gc::DEFAULT_GC_ROOT_TTL;
 pub use gc::{GcPassResult, GcStats, TtlCounter};
@@ -397,6 +398,7 @@ impl TurboTasksBackend {
     }
 
     pub(crate) fn start_operation(&self) -> Option<OperationGuard<'_>> {
+        turbo_tasks::assert_not_in_stateful_update();
         if !self.should_persist() {
             return None;
         }
@@ -419,11 +421,27 @@ impl TurboTasksBackend {
         &self,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) -> TestSnapshotOutcome {
+        self.snapshot_and_evict_with_callback_for_testing(turbo_tasks, || {})
+    }
+
+    /// Test-only checkpoint after the snapshot cut, once new operations are admitted
+    /// but before frozen task data is serialized and post-snapshot eviction runs.
+    #[doc(hidden)]
+    pub fn snapshot_and_evict_with_callback_for_testing(
+        &self,
+        turbo_tasks: &TurboTasks<TurboTasksBackend>,
+        after_cut: impl FnOnce(),
+    ) -> TestSnapshotOutcome {
         assert!(
             self.should_persist(),
             "snapshot_and_evict requires persistence"
         );
-        let snapshot_result = self.snapshot_and_persist(None, SnapshotReason::Test, turbo_tasks);
+        let snapshot_result = self.snapshot_and_persist_with_callback(
+            None,
+            SnapshotReason::Test,
+            turbo_tasks,
+            after_cut,
+        );
         let (had_new_data, gc_outcome) = match snapshot_result {
             Ok(Some((_, new_data, gc_outcome))) => (new_data, gc_outcome),
             Ok(None) => unreachable!("test snapshots wait for operations to settle"),
@@ -442,7 +460,47 @@ impl TurboTasksBackend {
         }
     }
 
-    /// The number oftasks resident in the map.
+    /// Remove an ordinary cell's cached content without dirtying its producer.
+    /// This forces the normal missing-content clean recomputation path in tests.
+    #[doc(hidden)]
+    pub fn remove_cell_for_testing(&self, task: TaskId, cell: CellId, tt: &TurboTasks<Self>) {
+        assert!(!get_value_type(cell.type_id()).stateful);
+        let mut ctx = self.execute_context(tt);
+        let mut task = ctx.task(task, TaskDataCategory::All);
+        task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence);
+    }
+
+    /// Inspect dirtyness without triggering execution, for deterministic race tests.
+    #[doc(hidden)]
+    pub fn is_dirty_for_testing(&self, task: TaskId, tt: &TurboTasks<Self>) -> bool {
+        let mut ctx = self.execute_context(tt);
+        ctx.task(task, TaskDataCategory::All).get_dirty().is_some()
+    }
+
+    /// Observe reservation wait registrations without entering snapshot admission.
+    /// The count resets on release; callers must keep the writer held while inspecting.
+    #[doc(hidden)]
+    pub fn stateful_waiters_for_testing(&self, task: TaskId) -> usize {
+        self.storage
+            .with_task(task, |t| t.stateful_waiting_accesses())
+            .unwrap_or(0)
+    }
+
+    /// Observe snapshot settlement without changing admission, for bounded tests.
+    #[doc(hidden)]
+    pub fn snapshot_is_waiting_for_testing(&self) -> bool {
+        self.snapshot_coord.is_waiting_for_operations()
+    }
+
+    /// Inspect restoration flags without restoring data, for eviction regressions.
+    #[doc(hidden)]
+    pub fn is_task_restored_for_testing(&self, task: TaskId) -> bool {
+        self.storage
+            .with_task(task, |t| t.flags.is_restored(TaskDataCategory::All))
+            .unwrap_or(false)
+    }
+
+    /// The number of tasks resident in the map.
     #[doc(hidden)]
     pub fn resident_task_count_for_testing(&self) -> usize {
         self.storage.resident_task_count_for_testing()
@@ -1013,6 +1071,15 @@ impl TurboTasksBackend {
         let (mut task, reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
         task.assert_not_deleted("read_task_cell");
+        if get_value_type(cell.type_id()).stateful {
+            if let Some(reservation) = task.get_stateful_cell_operation() {
+                return Ok(ReadOutcome::InProgress(reservation.event.listen()));
+            }
+            ensure!(
+                !final_read_hint,
+                "stateful contents cannot be consumed by final_read_hint"
+            );
+        }
 
         let content = if final_read_hint {
             task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence)
@@ -1148,6 +1215,20 @@ impl TurboTasksBackend {
         reason: SnapshotReason,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) -> Result<Option<(Instant, bool, Option<(GcStats, GcPassResult)>)>> {
+        self.snapshot_and_persist_with_callback(parent_span, reason, turbo_tasks, || {})
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "matches snapshot_and_persist test result"
+    )]
+    fn snapshot_and_persist_with_callback(
+        &self,
+        parent_span: Option<tracing::Id>,
+        reason: SnapshotReason,
+        turbo_tasks: &TurboTasks<TurboTasksBackend>,
+        after_cut: impl FnOnce(),
+    ) -> Result<Option<(Instant, bool, Option<(GcStats, GcPassResult)>)>> {
         let snapshot_span =
             tracing::trace_span!(parent: parent_span.clone(), "snapshot", reason = reason.as_str())
                 .entered();
@@ -1201,6 +1282,7 @@ impl TurboTasksBackend {
 
         let snapshot_time = Instant::now();
         drop(snapshot_phase);
+        after_cut();
 
         if !has_modifications && gc_roots_to_persist.is_none() {
             // No tasks modified since the last snapshot — drop the guard (which
@@ -2203,7 +2285,11 @@ impl TurboTasksBackend {
 
         let is_error = result.is_err();
 
-        let mut ctx = self.execute_context(turbo_tasks);
+        // Serialize bounded completion with stateful writes/initialization using
+        // this owner only. The reservation is never held across task execution.
+        let mut transaction = stateful_cell::CellTransaction::acquire(self, turbo_tasks, task_id)
+            .expect("executing task must exist");
+        let ctx = &mut transaction.ctx;
 
         let TaskExecutionCompletePrepareResult {
             new_children,
@@ -2217,7 +2303,7 @@ impl TurboTasksBackend {
             is_recomputation,
             is_session_dependent,
         } = match self.task_execution_completed_prepare(
-            &mut ctx,
+            ctx,
             #[cfg(feature = "trace_task_details")]
             &span,
             task_id,
@@ -2243,7 +2329,7 @@ impl TurboTasksBackend {
 
         if !output_dependent_tasks.is_empty() {
             self.task_execution_completed_invalidate_output_dependent(
-                &mut ctx,
+                ctx,
                 task_id,
                 #[cfg(feature = "task_dirty_cause")]
                 function_id,
@@ -2256,7 +2342,7 @@ impl TurboTasksBackend {
 
         if has_new_children
             && let Some(stale_priority) =
-                self.task_execution_completed_connect(&mut ctx, task_id, new_children)
+                self.task_execution_completed_connect(ctx, task_id, new_children)
         {
             // Task was stale and has been rescheduled
             #[cfg(feature = "trace_task_details")]
@@ -2265,7 +2351,7 @@ impl TurboTasksBackend {
         }
 
         let (stale_priority, in_progress_cells) = self.task_execution_completed_finish(
-            &mut ctx,
+            ctx,
             task_id,
             #[cfg(feature = "verify_determinism")]
             no_output_set,
@@ -2281,13 +2367,15 @@ impl TurboTasksBackend {
         }
 
         let removed_data = self.task_execution_completed_cleanup(
-            &mut ctx,
+            ctx,
             task_id,
             cell_counters,
             is_error,
             is_recomputation,
         );
 
+        // Release the owner reservation before running arbitrary value destructors.
+        drop(transaction);
         // Drop data outside of critical sections
         drop(removed_data);
         drop(in_progress_cells);
@@ -2413,6 +2501,10 @@ impl TurboTasksBackend {
             let mut counters_to_remove = old_counters.clone();
 
             for (&cell_type, &max_index) in cell_counters.iter() {
+                if result.is_err() && get_value_type(cell_type).stateful {
+                    counters_to_remove.remove(&cell_type);
+                    continue;
+                }
                 if let Some(old_max_index) = counters_to_remove.remove(&cell_type) {
                     if old_max_index != max_index {
                         task.insert_cell_type_max_index(cell_type, max_index);
@@ -2422,6 +2514,9 @@ impl TurboTasksBackend {
                 }
             }
             for (cell_type, _) in counters_to_remove {
+                if result.is_err() && get_value_type(cell_type).stateful {
+                    continue;
+                }
                 task.remove_cell_type_max_index(&cell_type);
             }
         }
@@ -2904,6 +2999,7 @@ impl TurboTasksBackend {
     ) -> Vec<SharedReference> {
         let mut task = ctx.task(task_id, TaskDataCategory::All);
         let mut removed_cell_data = Vec::new();
+        let mut retired_stateful_cells = Vec::new();
         // An error is potentially caused by a eventual consistency, so we avoid updating cells
         // after an error as it is likely transient and we want to keep the dependent tasks
         // clean to avoid re-executions.
@@ -2912,12 +3008,17 @@ impl TurboTasksBackend {
         if !is_error || is_recomputation {
             // Remove no longer existing cells and
             // find all outdated data items (removed cells, outdated edges)
-            // Note: We do not mark the tasks as dirty here, as these tasks are unused or stale
-            // anyway and we want to avoid needless re-executions. When the cells become
-            // used again, they are invalidated from the update cell operation.
+            // Ordinary cells are assumed unused/stale here and do not dirty readers.
+            // Escaped stateful handles violate that assumption: retire those slots
+            // through explicit invalidation after releasing the owner shard lock.
             let to_remove: Vec<_> = task
                 .iter_cell_data()
                 .filter_map(|(cell, _)| {
+                    // Failed clean recomputation cannot retire externally mutable
+                    // state based on its partial allocation counters.
+                    if is_error && get_value_type(cell.type_id()).stateful {
+                        return None;
+                    }
                     cell_counters
                         .get(&cell.type_id())
                         .is_none_or(|start_index| cell.index() >= *start_index)
@@ -2926,6 +3027,10 @@ impl TurboTasksBackend {
                 .collect();
             removed_cell_data.reserve_exact(to_remove.len());
             for cell in to_remove {
+                if get_value_type(cell.type_id()).stateful {
+                    retired_stateful_cells.push(cell);
+                    continue;
+                }
                 if let Some(data) =
                     task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence)
                 {
@@ -2951,6 +3056,14 @@ impl TurboTasksBackend {
         task.cleanup_after_execution();
 
         drop(task);
+
+        // Completion still owns its per-owner reservation and snapshot admission,
+        // so readers cannot consume a retired slot while invalidation propagates.
+        for cell in retired_stateful_cells {
+            if let Some(old) = operation::update_stateful_cell(task_id, cell, None, ctx) {
+                removed_cell_data.push(old);
+            }
+        }
 
         // Return so we can drop outside of critical sections
         removed_cell_data
@@ -3253,6 +3366,11 @@ impl TurboTasksBackend {
         cell: CellId,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) -> Result<TypedCellContent> {
+        if get_value_type(cell.type_id()).stateful {
+            return self
+                .read_stateful_cell_impl(task_id, cell, None, turbo_tasks)
+                .map(|content| CellContent(Some(content)).into_typed(cell.type_id()));
+        }
         let mut ctx = self.execute_context(turbo_tasks);
         let task = ctx.task(task_id, TaskDataCategory::Data);
         task.assert_not_deleted("try_read_own_task_cell");
@@ -3392,6 +3510,10 @@ impl TurboTasksBackend {
         verification_mode: VerificationMode,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) {
+        assert!(
+            !get_value_type(cell.type_id()).stateful,
+            "stateful cells must be written through StateCell"
+        );
         update_cell(
             task_id,
             cell,
@@ -3716,6 +3838,37 @@ impl TurboTasksBackend {
 }
 
 impl Backend for TurboTasksBackend {
+    fn initialize_stateful_cell(
+        &self,
+        task: TaskId,
+        cell: CellId,
+        value: turbo_tasks::SharedReference,
+        tt: &TurboTasks<Self>,
+    ) -> Result<()> {
+        self.initialize_stateful_cell_impl(task, cell, value, tt)
+    }
+
+    fn read_stateful_cell(
+        &self,
+        task: TaskId,
+        cell: CellId,
+        reader: Option<TaskId>,
+        tt: &TurboTasks<Self>,
+    ) -> Result<turbo_tasks::SharedReference> {
+        self.read_stateful_cell_impl(task, cell, reader, tt)
+    }
+
+    fn mutate_stateful_cell(
+        &self,
+        task: TaskId,
+        cell: CellId,
+        update: &mut dyn FnMut(
+            turbo_tasks::SharedReference,
+        ) -> Result<turbo_tasks::SharedReference>,
+        tt: &TurboTasks<Self>,
+    ) -> Result<()> {
+        self.mutate_stateful_cell_impl(task, cell, update, tt)
+    }
     fn startup(&self, turbo_tasks: &TurboTasks<Self>) {
         self.startup(turbo_tasks);
     }
