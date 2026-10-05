@@ -2284,7 +2284,7 @@ mod cell_data_tracking_tests {
     use crate::{
         backend::{
             TaskDataCategory,
-            storage::{Storage, StorageOptions, encode_task_contents},
+            storage::{SnapshotMask, Storage, StorageOptions, encode_task_contents},
             storage_schema::TaskStorageAccessors,
         },
         backing_storage::SnapshotItem,
@@ -2472,9 +2472,12 @@ mod cell_data_tracking_tests {
 
         let (snapshot_guard, has_modifications) = storage.start_snapshot();
         assert!(has_modifications);
-        let process = |_: TaskId, _: &TaskStorage, _: &mut TurboBincodeBuffer| -> SnapshotItem {
-            panic!("the pre-encoded snapshot item must be used")
-        };
+        let process =
+            |_: TaskId,
+             _: &TaskStorage,
+             _: SnapshotMask,
+             _: &mut TurboBincodeBuffer|
+             -> SnapshotItem { panic!("the pre-encoded snapshot item must be used") };
         let shards = storage.take_snapshot(snapshot_guard, &process, &|_, _| {}, false);
 
         {
